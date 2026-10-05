@@ -34,11 +34,24 @@ CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,   -- 全局提交顺序（稳定排序键）
     test_id     INTEGER NOT NULL REFERENCES tests(id),
     ts          INTEGER NOT NULL,                    -- 服务端事件时间（秒，事务内采集）
-    type        TEXT NOT NULL,   -- create/answer/adjust/settle/history_start
+    type        TEXT NOT NULL,   -- create/answer/adjust/settle/share_create/share_revoke/history_start
     payload     TEXT NOT NULL DEFAULT '{}'           -- JSON，盲态字段读取时再裁剪
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_test ON events(test_id, id);
+
+CREATE TABLE IF NOT EXISTS shares (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    test_id      INTEGER NOT NULL REFERENCES tests(id),
+    share_code   TEXT NOT NULL UNIQUE,   -- 一次性随机分享凭证（高熵，仅创建时向负责人展示）
+    note         TEXT NOT NULL DEFAULT '',           -- 可选备注（trim 后存储，空串为无备注）
+    ttl_seconds  INTEGER NOT NULL,                   -- 请求的有效期（秒，1..604800）
+    created_at   INTEGER NOT NULL,                   -- 创建时间（秒，事务内采集）
+    expires_at   INTEGER NOT NULL,                   -- created_at + ttl_seconds
+    revoked_at   INTEGER                             -- 非空表示已撤销（秒）
+);
+
+CREATE INDEX IF NOT EXISTS idx_shares_test ON shares(test_id);
 
 CREATE TABLE IF NOT EXISTS assignments (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,

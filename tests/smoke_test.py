@@ -740,6 +740,176 @@ try:
           [e["seq"] for e in ctt["events"]]
           == sorted(e["seq"] for e in ctt["events"]))
 
+    # --- 2.9 脱敏结果分享凭证（复用已结算的 t2：4 有效/3 对/1 弃权/1 未交） ---
+    share_path = f"/api/tests/{t2['test_code']}/shares"
+
+    # 未结算实验不能生成（bm 已答卷、未结算）
+    st, ns = req("POST", f"/api/tests/{bm['test_code']}/shares",
+                 {"token": bm["token"], "ttl_seconds": 3600})
+    check("未结算实验生成分享凭证被拒 (409)", st == 409, str(ns))
+    # 鉴权 / 参数校验
+    st, sw = req("POST", share_path, {"token": "wrong", "ttl_seconds": 3600})
+    check("分享凭证生成：错误令牌 403", st == 403)
+    st, ns2 = req("POST", share_path, {"token": t2["token"], "ttl_seconds": 0})
+    check("ttl < 1 被拒 (422)", st == 422)
+    st, ns3 = req("POST", share_path, {"token": t2["token"], "ttl_seconds": 7 * 86400 + 1})
+    check("ttl > 7 天被拒 (422)", st == 422, str(ns3))
+    st, ns4 = req("POST", "/api/tests/NOPE9999/shares",
+                  {"token": "x", "ttl_seconds": 3600})
+    check("不存在的实验生成分享凭证 404", st == 404)
+
+    # 生成（有备注）
+    st, sh = req("POST", share_path,
+                 {"token": t2["token"], "ttl_seconds": 3600, "note": " 合作方复核 "})
+    check("生成分享凭证 200", st == 200 and sh["reused"] is False, str(sh))
+    check("凭证为 24 位一次性随机码", len(sh["share_code"]) == 24
+          and sh["url"].endswith(sh["share_code"]))
+    check("备注 trim 存储", sh["note"] == "合作方复核", repr(sh["note"]))
+    check("expires_at = created_at + ttl（毫秒）",
+          sh["expires_at"] - sh["created_at"] == 3600_000)
+
+    # 同备注 + 同有效期 -> 返回原凭证（幂等）
+    st, sh_dup = req("POST", share_path,
+                     {"token": t2["token"], "ttl_seconds": 3600, "note": "合作方复核"})
+    check("同备注同有效期重复请求返回原凭证 (reused=true)",
+          st == 200 and sh_dup["reused"] is True
+          and sh_dup["share_code"] == sh["share_code"], str(sh_dup))
+    # 无备注视为同一备注；这里用不同备注，各自独立
+    st, sh_other = req("POST", share_path,
+                       {"token": t2["token"], "ttl_seconds": 7200, "note": "另一个用途"})
+    check("不同备注独立签发",
+          st == 200 and sh_other["share_code"] != sh["share_code"]
+          and sh_other["reused"] is False)
+    # 同备注但不同有效期 -> 409 冲突
+    st, conflict = req("POST", share_path,
+                       {"token": t2["token"], "ttl_seconds": 7200, "note": "合作方复核"})
+    check("同备注不同有效期冲突 (409)", st == 409, str(conflict))
+    # 7 天上界允许
+    st, sh_max = req("POST", share_path,
+                     {"token": t2["token"], "ttl_seconds": 7 * 86400, "note": "上限"})
+    check("ttl=7 天上界允许", st == 200, str(sh_max))
+
+    # 公开读取：脱敏字段白名单
+    st, rd = req("GET", f"/api/shares/{sh['share_code']}")
+    check("持凭证读取 200（无需令牌）", st == 200, str(rd))
+    check("读取含样本编号/时间/计数/p 值/结论",
+          rd["sample_a"] == "X-100" and rd["sample_b"] == "X-200"
+          and rd["deadline"] == rep["deadline"] and rd["settled_at"] == rep["settled_at"]
+          and rd["valid_count"] == 4 and rd["correct_count"] == 3
+          and rd["abstained_count"] == 1 and rd["missing_count"] == 1
+          and abs(rd["p_value"] - rep["p_value"]) < 1e-12
+          and rd["distinguishable"] is False
+          and "样本不足" in rd["conclusion"], str(rd))
+    forbidden = ("panelist", "code", "answer", "odd_pos", "odd_sample",
+                 "correct", "assignments", "token")
+    rd_blob = json.dumps(rd, ensure_ascii=False)
+    check("读取响应不含评员姓名/盲评码/个人答案/异样杯对应关系",
+          all(f'"{k}"' not in rd_blob for k in forbidden)
+          and "甲" not in rd_blob and "乙" not in rd_blob, rd_blob)
+
+    # 可辨场景（t3：4/4 全对，判为可辨）
+    st, sh_sig = req("POST", f"/api/tests/{t3['test_code']}/shares",
+                     {"token": t3["token"], "ttl_seconds": 3600})
+    check("可辨实验生成凭证 200", st == 200)
+    st, rd_sig = req("GET", f"/api/shares/{sh_sig['share_code']}")
+    check("可辨实验读取 distinguishable=true 且结论判为可辨",
+          st == 200 and rd_sig["distinguishable"] is True
+          and rd_sig["correct_count"] == 4 and rd_sig["valid_count"] == 4
+          and "判为可辨" in rd_sig["conclusion"], str(rd_sig))
+
+    # 无效 / 伪造凭证 404
+    st, bad = req("GET", "/api/shares/NOPE-NOPE-NOPE")
+    check("未知分享凭证 404", st == 404)
+
+    # 负责人列出本实验凭证
+    st, lst = req("GET", share_path + f"?token={t2['token']}")
+    check("列出本实验分享凭证 200", st == 200
+          and len(lst["shares"]) == 3 and all(s["active"] for s in lst["shares"]),
+          str(lst.get("shares")))
+    st, _ = req("GET", f"/api/tests/{t2['test_code']}/shares?token=wrong")
+    check("凭证列表错误令牌 403", st == 403)
+
+    # 时间线：share_create 各一笔
+    st, shtl = req("GET", f"/api/tests/{t2['test_code']}/timeline?token={t2['token']}")
+    sc_ev = [e for e in shtl["events"] if e["type"] == "share_create"]
+    check("生成凭证写入时间线（3 笔 share_create）", len(sc_ev) == 3,
+          str([e["type"] for e in shtl["events"]]))
+    check("share_create 事件含凭证/备注/有效期/到期",
+          all({"share_code", "note", "ttl_seconds", "expires_at"}
+              <= set(e["payload"]) for e in sc_ev))
+    before_revoke = len(shtl["events"])
+
+    # 撤销：错误令牌 403；正确撤销后读取 404
+    st, _ = req("POST", f"/api/shares/{sh['share_code']}/revoke",
+                {"token": "wrong"})
+    check("撤销错误令牌 403", st == 403)
+    st, rv = req("POST", f"/api/shares/{sh['share_code']}/revoke",
+                 {"token": t2["token"]})
+    check("到期前撤销 200", st == 200 and rv["active"] is False
+          and rv["already_revoked"] is False and rv["revoked_at"], str(rv))
+    st, rv2 = req("POST", f"/api/shares/{sh['share_code']}/revoke",
+                  {"token": t2["token"]})
+    check("重复撤销幂等（already_revoked=true）",
+          st == 200 and rv2["already_revoked"] is True)
+    st, rd_rev = req("GET", f"/api/shares/{sh['share_code']}")
+    check("撤销后读取被拒 404", st == 404, str(rd_rev))
+    # 撤销事件留痕，且幂等撤销不重复留痕
+    st, shtl2 = req("GET", f"/api/tests/{t2['test_code']}/timeline?token={t2['token']}")
+    rv_ev = [e for e in shtl2["events"] if e["type"] == "share_revoke"]
+    check("撤销写入时间线（仅 1 笔 share_revoke）",
+          len(rv_ev) == 1 and len(shtl2["events"]) == before_revoke + 1
+          and rv_ev[0]["payload"]["share_code"] == sh["share_code"],
+          str([(e["type"], e["payload"].get("share_code")) for e in shtl2["events"]]))
+    # 不能撤销别人实验的凭证（用 t3 的令牌撤 t2 的凭证）
+    st, cross = req("POST", f"/api/shares/{sh_other['share_code']}/revoke",
+                    {"token": t3["token"]})
+    check("非本实验负责人撤销 403", st == 403, str(cross))
+
+    # 到期拒绝：TTL=1 秒的凭证，到期后读取 404，撤销也 409
+    st, sh1 = req("POST", f"/api/tests/{t4['test_code']}/shares",
+                  {"token": t4["token"], "ttl_seconds": 1, "note": "短命"})
+    check("零有效答卷实验也可分享（已结算）", st == 200 and sh1["reused"] is False)
+    st, rd1 = req("GET", f"/api/shares/{sh1['share_code']}")
+    check("到期前可读", st == 200 and rd1["valid_count"] == 0
+          and rd1["p_value"] == 1.0)
+    time.sleep(1.6)
+    st, rd_exp = req("GET", f"/api/shares/{sh1['share_code']}")
+    check("到期后读取被拒 404", st == 404, str(rd_exp))
+    st, rv_exp = req("POST", f"/api/shares/{sh1['share_code']}/revoke",
+                     {"token": t4["token"]})
+    check("到期后撤销返回 409", st == 409, str(rv_exp))
+    # 到期凭证不参与同备注幂等：同备注同有效期重新签发得到新凭证
+    st, sh1_new = req("POST", f"/api/tests/{t4['test_code']}/shares",
+                      {"token": t4["token"], "ttl_seconds": 3600, "note": "短命"})
+    check("原凭证到期后同备注请求签发新凭证",
+          st == 200 and sh1_new["share_code"] != sh1["share_code"]
+          and sh1_new["reused"] is False, str(sh1_new))
+
+    # 撤销不存在的凭证 404
+    st, _ = req("POST", "/api/shares/NOPE-NOPE-NOPE/revoke", {"token": "x"})
+    check("撤销未知凭证 404", st == 404)
+
+    # 撤销一张未到期凭证后，同备注同有效期可重新签发（撤销不占用幂等键）
+    st, sh_r = req("POST", share_path,
+                   {"token": t2["token"], "ttl_seconds": 1800, "note": "临时撤销测试"})
+    assert st == 200
+    req("POST", f"/api/shares/{sh_r['share_code']}/revoke", {"token": t2["token"]})
+    st, sh_r2 = req("POST", share_path,
+                    {"token": t2["token"], "ttl_seconds": 1800, "note": "临时撤销测试"})
+    check("撤销后同备注同有效期可重新签发新凭证",
+          st == 200 and sh_r2["share_code"] != sh_r["share_code"]
+          and sh_r2["reused"] is False, str(sh_r2))
+
+    # 列表中状态反映 已撤销/已过期/有效
+    st, lst2 = req("GET", f"/api/tests/{t2['test_code']}/shares?token={t2['token']}")
+    by_code = {s["share_code"]: s for s in lst2["shares"]}
+    check("凭证列表状态：已撤销 active=false，未撤销仍有效",
+          by_code[sh["share_code"]]["active"] is False
+          and by_code[sh_other["share_code"]]["active"] is True, str(by_code))
+    st, lst3 = req("GET", f"/api/tests/{t4['test_code']}/shares?token={t4['token']}")
+    by4 = {s["share_code"]: s for s in lst3["shares"]}
+    check("已过期凭证 active=false", by4[sh1["share_code"]]["active"] is False)
+
     # --- 2.6 页面可达性 ---
     for path in ("/", "/admin", "/eval", f"/eval/code/{codes[0]}"):
         with urllib.request.urlopen(base + path, timeout=5) as r:

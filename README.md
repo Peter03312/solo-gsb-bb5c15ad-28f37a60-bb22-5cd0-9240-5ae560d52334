@@ -41,6 +41,18 @@
    - 升级前由旧版本创建的测试没有既往操作记录，时间线首条为 **`history_start`
      记录起点标记**（响应中 `history_complete=false`），明确说明既往操作不可追溯，
      **不虚构历史**；升级后新建测试 `history_complete=true`、记录完整。
+9. **脱敏结果分享凭证**：实验结算后，负责人可凭现有管理凭证为实验生成
+   **一次性随机分享凭证**，输入有效期（1 秒～**最长 7 天**）与可选备注，
+   返回随机凭证与可调用地址（凭证仅本次完整返回）：
+   - 持凭证即可公开读取，**只返回样本编号、截止与结算时间、有效答卷数、
+     答对数、弃权数、未交数、单侧尾概率和可辨结论**；
+     **不得返回**评员姓名、盲评码、个人答案或异样杯对应关系；
+   - 负责人可在到期前撤销凭证；**到期或撤销后读取一律拒绝**
+     （统一返回 404，不区分凭证是否存在，避免被探测）；
+   - 仅允许对**已结算**实验生成；生成与撤销均写入该实验的操作时间线
+     （`share_create` / `share_revoke`，与状态同事务原子提交）；
+   - 同一实验**同一备注 + 同一有效期**重复请求**返回原凭证**（幂等），
+     同备注但有效期不同返回 **409 冲突**；不同备注各自独立签发。
 
 **评员**
 
@@ -114,7 +126,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 测试仅依赖 Python 标准库，会启动真实 uvicorn 子进程走完整 HTTP 流程
 （统计函数交叉验证、输入校验、盲态保密、一次提交、截止拒答、结算判定、冻结、回看、
 撤回/补位、均衡再分配、有效人数上下限、撤回与答卷并发竞争、操作时间线的顺序/盲态/
-原子性/并发一致性，以及旧数据库升级的记录起点标记）：
+原子性/并发一致性，旧数据库升级的记录起点标记，以及脱敏分享凭证的生成/幂等冲突/
+脱敏读取/撤销与到期拒绝/时间线留痕）：
 
 ```bash
 pip install -r requirements.txt
@@ -130,6 +143,10 @@ python tests/smoke_test.py
 | POST | `/api/tests/{code}/adjust` | 截止前撤回盲评码 / 补位评员（可单用或合用） |
 | POST | `/api/tests/{code}/settle` | 截止后结算（重复调用返回冻结结果） |
 | GET  | `/api/tests/{code}/timeline?token=` | 负责人操作时间线（结算后才透出选杯与对错） |
+| POST | `/api/tests/{code}/shares` | 已结算实验生成脱敏结果分享凭证（有效期 + 备注） |
+| GET  | `/api/tests/{code}/shares?token=` | 负责人列出本实验全部分享凭证 |
+| POST | `/api/shares/{share_code}/revoke` | 负责人到期前撤销分享凭证 |
+| GET  | `/api/shares/{share_code}` | 持凭证公开读取脱敏结算结果 |
 | GET  | `/api/eval/{code}` | 评员视图（结算前无任何分配/样本信息） |
 | POST | `/api/eval/{code}/submit` | 提交 `{"answer":1|2|3}` 或 `{"abstain":true}` |
 | GET  | `/api/time` | 服务端当前时间（毫秒） |
@@ -247,15 +264,111 @@ curl "http://localhost:8080/api/tests/AbCdEf12/timeline?token=负责人令牌"
 | `answer` | 评员答卷 / 弃权（与答卷状态同事务） | 关联评员与盲评码；结算后才有选杯、异样杯、异样样本、对错 |
 | `adjust` | 一次名单调整（撤回 + 补位同在一笔明细） | `withdrawn[]`、`added[]`、调整后有效人数 |
 | `settle` | 结算形成（与冻结状态同事务；重复结算不追加） | 有效 / 答对 / 弃权 / 未交数、p 值、判定 |
+| `share_create` | 脱敏结果分享凭证生成（与凭证同事务） | 分享凭证、备注、有效期、到期时间 |
+| `share_revoke` | 分享凭证撤销（与撤销状态同事务） | 分享凭证、备注、到期时间 |
 | `history_start` | 旧库升级后的记录起点标记 | `note` 说明既往操作不可追溯、`legacy_created_at` |
 
 原子性：答卷、调整、结算的业务状态与对应事件在同一个 `BEGIN IMMEDIATE` 事务中提交，
 任一校验失败整体回滚，时间线不会出现半截记录；并发操作以实际先拿到写锁并提交者为准，
 事件 `seq` 顺序与数据库最终状态一致。
 
+### 脱敏结果分享凭证接口调用示例
+
+**① 生成凭证**（仅已结算实验；负责人管理凭证鉴权）
+
+`POST /api/tests/{test_code}/shares`：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `token` | string | 创建测试时发放的负责人令牌（必填） |
+| `ttl_seconds` | int | 有效期秒数，`1 ~ 604800`（7 天，含边界） |
+| `note` | string | 可选备注（trim 后存储，空串等同无备注，最长 200 字） |
+
+```bash
+curl -X POST http://localhost:8080/api/tests/AbCdEf12/shares \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"负责人令牌","ttl_seconds":86400,"note":"发给合作方复核"}'
+```
+
+成功响应（随机凭证仅本次完整展示，请立即保存）：
+
+```json
+{
+  "test_code": "AbCdEf12",
+  "share_code": "9fKm3pQvXrT2bWzN8hJaYcEd",
+  "note": "发给合作方复核",
+  "ttl_seconds": 86400,
+  "created_at": 1759000000000,
+  "expires_at": 1759086400000,
+  "active": true,
+  "reused": false,
+  "url": "/api/shares/9fKm3pQvXrT2bWzN8hJaYcEd"
+}
+```
+
+- 同实验**同备注 + 同 ttl** 的重复请求：返回同一条原凭证，`reused=true`（不另发新码）；
+- 同实验**同备注、不同 ttl** 且原凭证仍有效：**409 冲突**；
+- 未结算实验：**409**；令牌错误 **403**；测试不存在 **404**；
+  `ttl_seconds` 越界（`>604800`、`<1`）：**422**。
+
+**② 持凭证读取脱敏结果**（无需任何其他凭证）
+
+```bash
+curl http://localhost:8080/api/shares/9fKm3pQvXrT2bWzN8hJaYcEd
+```
+
+```json
+{
+  "sample_a": "茉莉",
+  "sample_b": "玫瑰",
+  "deadline": 1759002600000,
+  "settled_at": 1759003000000,
+  "valid_count": 12,
+  "correct_count": 8,
+  "abstained_count": 1,
+  "missing_count": 2,
+  "p_value": 0.0187,
+  "distinguishable": true,
+  "conclusion": "有效答卷 12 份、答对 8 份，单侧尾概率 p=0.0187 ≤ 0.05：判为可辨。",
+  "note": "发给合作方复核",
+  "expires_at": 1759086400000,
+  "now": 1759004000000
+}
+```
+
+响应字段为**白名单**：不含评员姓名、盲评码、任何个人选杯答案，也不含异样杯
+位置 / 异样样本对应关系。凭证不存在、已撤销或已到期统一返回 `404`
+（`detail: 分享凭证无效、已撤销或已过期`），不区分具体原因。
+
+**③ 到期前撤销**（负责人鉴权；撤销幂等，重复撤销返回 `already_revoked=true`）
+
+```bash
+curl -X POST http://localhost:8080/api/shares/9fKm3pQvXrT2bWzN8hJaYcEd/revoke \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"负责人令牌"}'
+```
+
+**④ 查看本实验全部凭证**（含已撤销 / 已过期，按签发顺序）
+
+```bash
+curl "http://localhost:8080/api/tests/AbCdEf12/shares?token=负责人令牌"
+```
+
+生成与撤销都会在负责人时间线中各留一条记录（与凭证状态同一写事务）：
+
+| 事件 type | 关键字段 |
+| --- | --- |
+| `share_create` | `share_code`、`note`、`ttl_seconds`、`expires_at` |
+| `share_revoke` | `share_code`、`note`、`expires_at` |
+
+管理台（`/admin`）在实验结算后会出现「脱敏结果分享凭证」卡片，可直接
+选择有效期、填写备注生成、复制读取地址，并对有效凭证一键撤销。
+
 ## 安全与使用注意
 
 - **负责人令牌只在创建测试时返回一次**，请立即保存；它与测试码共同构成管理凭证（服务端只存 SHA-256 哈希）。
+- **分享凭证本身即无记名读取凭证**（24 位高熵随机码）：持有即可在有效期内读取脱敏结果，
+  请通过可信渠道点对点发送；不再需要分享时可随时在到期前撤销，到期后服务端自动拒绝读取。
 - 盲评码仅用于防混淆与一次性提交，不是身份认证：分发链接时应单独、点对点发给对应评员。
 - 部署到不可信网络时建议置于 HTTPS 反向代理之后。
 - 应用固定单 uvicorn worker（SQLite 单库写已串行化，满足实验规模；多 worker 也可借助 WAL 工作，但无必要）。
@@ -264,7 +377,7 @@ curl "http://localhost:8080/api/tests/AbCdEf12/timeline?token=负责人令牌"
 
 ```
 app/
-  main.py        # FastAPI 路由与业务逻辑（含操作时间线接口）
+  main.py        # FastAPI 路由与业务逻辑（含操作时间线、脱敏结果分享凭证）
   db.py          # SQLite 连接、建表、写事务、事件写入与旧库起点标记
   stats.py       # 二项分布单侧尾概率
 static/

@@ -30,6 +30,7 @@ ABSTAIN = -1
 ACTIVE = "active"
 WITHDRAWN = "withdrawn"
 MAX_PANELISTS = 500
+MAX_SHARE_TTL = 7 * 24 * 3600  # 脱敏结果分享凭证最长有效期：7 天（秒）
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +222,20 @@ class AdjustRoster(BaseModel):
     )
 
 
+class ShareCreate(BaseModel):
+    """为已结算实验生成脱敏结果分享凭证。"""
+    token: str
+    ttl_seconds: int = Field(
+        ge=1, le=MAX_SHARE_TTL,
+        description="凭证有效期（秒），最长 7 天（604800 秒）",
+    )
+    note: Optional[str] = Field(default=None, max_length=200)
+
+
+class ShareRevoke(BaseModel):
+    token: str
+
+
 # ---------------------------------------------------------------------------
 # 应用
 # ---------------------------------------------------------------------------
@@ -231,7 +246,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="三角嗅辨盲评工作台", version="1.2", lifespan=lifespan)
+app = FastAPI(title="三角嗅辨盲评工作台", version="1.3", lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -729,6 +744,236 @@ def timeline(test_code: str, token: str):
         # 存在 history_start 标记表示该测试既往操作无法追溯（旧库升级）
         "history_complete": all(e["type"] != "history_start" for e in events),
         "events": [render_event(e, settled, assign_by_code) for e in events],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 脱敏结果分享凭证（负责人签发 / 撤销；持凭证者公开读取脱敏结果）
+# ---------------------------------------------------------------------------
+
+def _share_summary(row) -> dict:
+    """负责人视角的凭证条目（含随机凭证本身，仅管理接口返回）。"""
+    ts = now_ts()
+    active = row["revoked_at"] is None and ts < row["expires_at"]
+    return {
+        "share_code": row["share_code"],
+        "note": row["note"],
+        "ttl_seconds": row["ttl_seconds"],
+        "created_at": row["created_at"] * 1000,
+        "expires_at": row["expires_at"] * 1000,
+        "revoked_at": None if row["revoked_at"] is None else row["revoked_at"] * 1000,
+        "active": active,
+        "url": f"/api/shares/{row['share_code']}",
+    }
+
+
+@app.post("/api/tests/{test_code}/shares")
+def create_share(test_code: str, body: ShareCreate):
+    """为**已结算**实验生成脱敏结果分享凭证。
+
+    - 鉴权与其他管理接口一致（测试码 + 负责人令牌）。
+    - ttl_seconds 取 1..604800（7 天）；备注可空，存储前 trim，空串等同无备注。
+    - 幂等：同一实验存在**有效**（未撤销、未到期）且备注与有效期完全相同的凭证时，
+      直接返回原凭证（reused=true），不另发新凭证；
+      同备注但有效期不同 -> 409（其他内容冲突），其余请求正常签发新凭证。
+    - 仅已结算实验可签发；签发与撤销都写入该实验的操作时间线（同一写事务）。
+    """
+    note = (body.note or "").strip()
+    if len(note) > 200:
+        raise HTTPException(status_code=422, detail="备注最长 200 字")
+
+    with db.write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (test_code,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="测试不存在")
+        verify_admin(row, body.token)
+
+        if row["settled_at"] is None:
+            raise HTTPException(
+                status_code=409,
+                detail="仅已结算实验可生成脱敏结果分享凭证",
+            )
+
+        # 同一备注（含无备注）下：有效凭证有效期一致 -> 复用；不一致 -> 冲突
+        existing = conn.execute(
+            "SELECT * FROM shares WHERE test_id = ? AND note = ? "
+            "AND revoked_at IS NULL AND expires_at > ? ORDER BY id",
+            (row["id"], note, now_ts()),
+        ).fetchall()
+        if existing:
+            same_ttl = next(
+                (s for s in existing if s["ttl_seconds"] == body.ttl_seconds), None
+            )
+            if same_ttl is not None:
+                data = _share_summary(same_ttl)
+                data["reused"] = True
+                data["test_code"] = row["code"]
+                return data
+            raise HTTPException(
+                status_code=409,
+                detail="该实验已存在相同备注、不同有效期的有效分享凭证，"
+                       "请先撤销原凭证或更换备注/有效期",
+            )
+
+        ts = now_ts()
+        expires_at = ts + body.ttl_seconds
+        while True:  # 全局 UNIQUE(share_code)，撞码（极小概率）则重取
+            share_code = new_code(24)
+            if conn.execute(
+                "SELECT 1 FROM shares WHERE share_code = ?", (share_code,)
+            ).fetchone() is None:
+                break
+        conn.execute(
+            """INSERT INTO shares
+               (test_id, share_code, note, ttl_seconds, created_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (row["id"], share_code, note, body.ttl_seconds, ts, expires_at),
+        )
+        # 签发事件与凭证同一写事务进入操作时间线
+        db.log_event(conn, row["id"], ts, "share_create", {
+            "share_code": share_code,
+            "note": note,
+            "ttl_seconds": body.ttl_seconds,
+            "expires_at": expires_at * 1000,
+        })
+
+    return {
+        "test_code": row["code"],
+        "share_code": share_code,
+        "note": note,
+        "ttl_seconds": body.ttl_seconds,
+        "created_at": ts * 1000,
+        "expires_at": expires_at * 1000,
+        "active": True,
+        "reused": False,
+        "url": f"/api/shares/{share_code}",
+    }
+
+
+@app.get("/api/tests/{test_code}/shares")
+def list_shares(test_code: str, token: str):
+    """负责人查看本实验全部分享凭证（含已撤销/已过期），按签发顺序返回。"""
+    row = require_admin(test_code, token)
+    conn = db.read_conn()
+    try:
+        shares = conn.execute(
+            "SELECT * FROM shares WHERE test_id = ? ORDER BY id", (row["id"],)
+        ).fetchall()
+    finally:
+        conn.close()
+    return {
+        "test_code": row["code"],
+        "now": now_ts() * 1000,
+        "shares": [_share_summary(s) for s in shares],
+    }
+
+
+@app.post("/api/shares/{share_code}/revoke")
+def revoke_share(share_code: str, body: ShareRevoke):
+    """负责人在到期前撤销分享凭证；到期或撤销后读取一律拒绝。
+
+    撤销幂等：重复撤销一张**已撤销**的凭证返回成功（active=false）；
+    已到期的凭证无需撤销 -> 409。非该实验负责人 -> 403。
+    撤销与时间线事件在同一写事务内提交。
+    """
+    with db.write_tx() as conn:
+        s = conn.execute(
+            "SELECT * FROM shares WHERE share_code = ?", (share_code,)
+        ).fetchone()
+        if s is None:
+            raise HTTPException(status_code=404, detail="分享凭证不存在")
+        row = conn.execute(
+            "SELECT * FROM tests WHERE id = ?", (s["test_id"],)
+        ).fetchone()
+        verify_admin(row, body.token)
+
+        ts = now_ts()
+        if s["revoked_at"] is not None:
+            revoked = s
+            already = True
+        else:
+            if ts >= s["expires_at"]:
+                raise HTTPException(
+                    status_code=409, detail="分享凭证已到期，无需撤销"
+                )
+            conn.execute(
+                "UPDATE shares SET revoked_at = ? WHERE id = ?", (ts, s["id"])
+            )
+            db.log_event(conn, row["id"], ts, "share_revoke", {
+                "share_code": s["share_code"],
+                "note": s["note"],
+                "expires_at": s["expires_at"] * 1000,
+            })
+            revoked = conn.execute(
+                "SELECT * FROM shares WHERE id = ?", (s["id"],)
+            ).fetchone()
+            already = False
+
+    data = _share_summary(revoked)
+    data["test_code"] = row["code"]
+    data["ok"] = True
+    data["already_revoked"] = already
+    return data
+
+
+@app.get("/api/shares/{share_code}")
+def read_share(share_code: str):
+    """持凭证公开读取**脱敏**结算结果，无需其他身份凭证。
+
+    仅返回：样本编号、截止与结算时间、有效答卷数、答对数、弃权数、未交数、
+    单侧尾概率与可辨结论（含可辨布尔值）。绝不返回评员姓名、盲评码、
+    个人答案或异样杯对应关系。
+    凭证不存在 / 已撤销 / 已到期 -> 404（不区分，避免探测有效凭证状态）。
+    """
+    conn = db.read_conn()
+    try:
+        s = conn.execute(
+            "SELECT * FROM shares WHERE share_code = ?", (share_code,)
+        ).fetchone()
+        if s is not None:
+            t = conn.execute(
+                "SELECT * FROM tests WHERE id = ?", (s["test_id"],)
+            ).fetchone()
+            counts = conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN answer = ? THEN 1 ELSE 0 END) AS abstained, "
+                "SUM(CASE WHEN answer IS NULL THEN 1 ELSE 0 END) AS missing "
+                "FROM assignments WHERE test_id = ? AND status = ?",
+                (ABSTAIN, s["test_id"], ACTIVE),
+            ).fetchone()
+    finally:
+        conn.close()
+
+    now = now_ts()
+    if s is None or s["revoked_at"] is not None or now >= s["expires_at"]:
+        raise HTTPException(status_code=404, detail="分享凭证无效、已撤销或已过期")
+    # 仅已结算实验才能签发，正常流程 t 必然已结算；防御性校验不泄露未结算数据
+    if t is None or t["settled_at"] is None:
+        raise HTTPException(status_code=404, detail="分享凭证无效、已撤销或已过期")
+
+    frozen = {
+        "valid_count": t["valid_count"],
+        "correct_count": t["correct_count"],
+        "min_valid": t["min_valid"],
+        "p_value": t["p_value"],
+    }
+    return {
+        "sample_a": t["sample_a"],
+        "sample_b": t["sample_b"],
+        "deadline": t["deadline"] * 1000,
+        "settled_at": t["settled_at"] * 1000,
+        "valid_count": t["valid_count"],
+        "correct_count": t["correct_count"],
+        "abstained_count": counts["abstained"] or 0,
+        "missing_count": counts["missing"] or 0,
+        "p_value": t["p_value"],
+        "distinguishable": bool(t["distinguishable"]),
+        "conclusion": settlement_conclusion(frozen),
+        "note": s["note"],
+        "expires_at": s["expires_at"] * 1000,
+        "now": now * 1000,
     }
 
 

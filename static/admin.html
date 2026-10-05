@@ -66,6 +66,31 @@ function render(t) {
       <div id="report"></div>
     </div>
 
+    ${t.settled ? `
+    <div class="card" id="shareCard">
+      <h2>脱敏结果分享凭证</h2>
+      <p class="hint">
+        为已结算实验生成一次性随机凭证，接收方无需令牌即可读取
+        <b>样本编号、截止/结算时间、有效答卷数、答对数、弃权数、未交数、
+        单侧尾概率与可辨结论</b>；评员姓名、盲评码、个人答案与异样杯对应关系
+        <b>一律不返回</b>。有效期最长 7 天，到期或撤销后读取立即被拒。
+      </p>
+      <label>有效期</label>
+      <select id="shareTtl">
+        <option value="3600">1 小时</option>
+        <option value="43200">12 小时</option>
+        <option value="86400" selected>1 天</option>
+        <option value="259200">3 天</option>
+        <option value="604800">7 天（最长）</option>
+      </select>
+      <label>备注（可选；同备注 + 同有效期重复请求返回原凭证，同备注不同有效期冲突）</label>
+      <input id="shareNote" type="text" maxlength="200"
+        placeholder="例如：发给合作方的复核链接">
+      <button id="shareCreateBtn">生成分享凭证</button>
+      <div id="shareMsg"></div>
+      <div id="shareList"><p class="small">加载中…</p></div>
+    </div>` : ''}
+
     <div class="card">
       <h2>名单调整（截止前 · 缺席处理）</h2>
       <p class="hint">
@@ -120,7 +145,84 @@ function render(t) {
   document.getElementById('settleBtn').addEventListener('click', doSettle);
   const adjustBtn = document.getElementById('adjustBtn');
   if (adjustBtn) adjustBtn.addEventListener('click', doAdjust);
+  const shareCreateBtn = document.getElementById('shareCreateBtn');
+  if (shareCreateBtn) {
+    shareCreateBtn.addEventListener('click', doCreateShare);
+    loadShares();
+  }
   if (t.settled) doSettle();
+}
+
+async function doCreateShare() {
+  const msgEl = document.getElementById('shareMsg');
+  const ttl = Number(document.getElementById('shareTtl').value);
+  const note = document.getElementById('shareNote').value.trim();
+  const btn = document.getElementById('shareCreateBtn');
+  btn.disabled = true; btn.textContent = '生成中…';
+  try {
+    const r = await api(`/api/tests/${encodeURIComponent(code)}/shares`, {
+      method: 'POST',
+      body: { token, ttl_seconds: ttl, note },
+    });
+    const fullUrl = location.origin + r.url;
+    showInfo(msgEl,
+      (r.reused ? '该备注+有效期的有效凭证已存在，返回原凭证：'
+                : '已生成分享凭证（仅本次完整展示，请立即保存）：') +
+      ` ${r.share_code} ｜ 读取地址 ${fullUrl}`, 'ok');
+    await loadShares();
+  } catch (err) {
+    showErr(msgEl, err.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '生成分享凭证';
+  }
+}
+
+async function loadShares() {
+  const el = document.getElementById('shareList');
+  if (!el) return;
+  try {
+    const r = await api(
+      `/api/tests/${encodeURIComponent(code)}/shares?token=${encodeURIComponent(token)}`);
+    if (!r.shares.length) {
+      el.innerHTML = '<p class="small">尚未生成分享凭证。</p>';
+      return;
+    }
+    el.innerHTML = `
+      <table>
+        <thead><tr><th>凭证</th><th>备注</th><th>有效期至</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>
+          ${r.shares.slice().reverse().map(s => `
+            <tr>
+              <td class="code">${esc(s.share_code)}</td>
+              <td>${esc(s.note || '—')}</td>
+              <td>${esc(fmtTime(s.expires_at))}</td>
+              <td>${s.active ? '<span class="badge ok">有效</span>'
+                : (s.revoked_at ? '<span class="badge no">已撤销</span>'
+                  : '<span class="badge wait">已过期</span>')}</td>
+              <td>${s.active
+                ? `<button class="mini" data-revoke="${esc(s.share_code)}">撤销</button>`
+                : '—'}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>`;
+    el.querySelectorAll('button[data-revoke]').forEach((b) => {
+      b.addEventListener('click', () => doRevokeShare(b.dataset.revoke));
+    });
+  } catch (err) {
+    el.innerHTML = `<p class="small">凭证列表加载失败：${esc(err.message)}</p>`;
+  }
+}
+
+async function doRevokeShare(shareCode) {
+  if (!confirm('确认立即撤销该分享凭证？撤销后任何读取都将被拒绝。')) return;
+  try {
+    await api(`/api/shares/${encodeURIComponent(shareCode)}/revoke`, {
+      method: 'POST', body: { token },
+    });
+    await loadShares();
+  } catch (err) {
+    alert(err.message);
+  }
 }
 
 async function doAdjust() {
