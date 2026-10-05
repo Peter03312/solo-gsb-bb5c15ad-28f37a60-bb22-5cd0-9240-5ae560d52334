@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,   -- 全局提交顺序（稳定排序键）
     test_id     INTEGER NOT NULL REFERENCES tests(id),
     ts          INTEGER NOT NULL,                    -- 服务端事件时间（秒，事务内采集）
-    type        TEXT NOT NULL,   -- create/answer/adjust/settle/history_start
+    type        TEXT NOT NULL,   -- create/answer/adjust/settle/history_start/share_create/share_revoke
     payload     TEXT NOT NULL DEFAULT '{}'           -- JSON，盲态字段读取时再裁剪
 );
 
@@ -54,6 +54,23 @@ CREATE TABLE IF NOT EXISTS assignments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_assignments_test ON assignments(test_id);
+
+-- 已结算实验的脱敏结果分享凭证（不记名只读能力凭证）：
+-- 仅已结算测试可生成；到期或撤销后读取一律拒绝。
+-- (test_id, note, ttl_seconds) 唯一：同实验同备注同有效期重复请求返回原凭证。
+CREATE TABLE IF NOT EXISTS shares (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    test_id      INTEGER NOT NULL REFERENCES tests(id),
+    share_code   TEXT NOT NULL UNIQUE,                -- 一次性随机分享凭证（读取凭证）
+    note         TEXT NOT NULL DEFAULT '',            -- 负责人备注（归一化 trim 后存储）
+    ttl_seconds  INTEGER NOT NULL,                    -- 有效期（秒），最长 7 天
+    created_at   INTEGER NOT NULL,                    -- 生成时间（秒）
+    expires_at   INTEGER NOT NULL,                    -- 到期时间（秒，服务端时钟判定）
+    revoked_at   INTEGER,                             -- 撤销时间（秒）；NULL 未撤销
+    UNIQUE(test_id, note, ttl_seconds)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shares_test ON shares(test_id);
 """
 
 

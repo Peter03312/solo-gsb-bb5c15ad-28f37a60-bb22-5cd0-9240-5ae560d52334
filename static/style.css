@@ -40,13 +40,14 @@ header.hero p { margin: 0; color: var(--muted); font-size: 14px; }
 
 label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 4px; }
 
-input[type=text], input[type=number], input[type=datetime-local], textarea {
+input[type=text], input[type=number], input[type=datetime-local], textarea, select {
   width: 100%;
   padding: 10px 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
   font-size: 15px;
   font-family: inherit;
+  background: #fff;
 }
 
 textarea { resize: vertical; min-height: 96px; }

@@ -30,6 +30,8 @@ ABSTAIN = -1
 ACTIVE = "active"
 WITHDRAWN = "withdrawn"
 MAX_PANELISTS = 500
+MAX_SHARE_TTL_SECONDS = 7 * 24 * 3600  # 脱敏结果分享凭证最长有效期：7 天
+MAX_SHARE_NOTE_LEN = 200
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +192,47 @@ def render_event(ev: dict, settled: bool, assign_by_code: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 脱敏结果分享凭证
+# ---------------------------------------------------------------------------
+
+def share_admin_json(s, now: int) -> dict:
+    """负责人视角的凭证信息（管理台/进度接口用；凭证本身仍只在生成时发放一次）。"""
+    revoked = s["revoked_at"] is not None
+    return {
+        "share_code": s["share_code"],
+        "read_url": f"/api/shares/{s['share_code']}",
+        "note": s["note"],
+        "ttl_seconds": s["ttl_seconds"],
+        "created_at": s["created_at"] * 1000,
+        "expires_at": s["expires_at"] * 1000,
+        "revoked_at": None if s["revoked_at"] is None else s["revoked_at"] * 1000,
+        "active": not revoked and now < s["expires_at"],
+        "revoked": revoked,
+    }
+
+
+def sanitized_result(test, counts: dict, read_ts: int) -> dict:
+    """分享凭证读取的唯一允许载荷：仅聚合脱敏结果。
+
+    严禁出现评员姓名、盲评码、个人答案或异样杯对应关系（odd_pos/odd_sample）。
+    """
+    return {
+        "sample_a": test["sample_a"],
+        "sample_b": test["sample_b"],
+        "deadline": test["deadline"] * 1000,
+        "settled_at": test["settled_at"] * 1000,
+        "valid_count": test["valid_count"],
+        "correct_count": test["correct_count"],
+        "abstained_count": counts["abstained"],
+        "missing_count": counts["missing"],
+        "p_value": test["p_value"],
+        "distinguishable": bool(test["distinguishable"]),
+        "conclusion": settlement_conclusion(test),
+        "now": read_ts * 1000,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 请求模型
 # ---------------------------------------------------------------------------
 
@@ -221,6 +264,23 @@ class AdjustRoster(BaseModel):
     )
 
 
+class ShareCreate(BaseModel):
+    """为已结算实验生成脱敏结果分享凭证。"""
+    token: str
+    ttl_seconds: int = Field(
+        ge=1, le=MAX_SHARE_TTL_SECONDS,
+        description="有效期（秒），最长 7 天（604800 秒）",
+    )
+    note: Optional[str] = Field(
+        default=None, max_length=MAX_SHARE_NOTE_LEN,
+        description="可选备注（trim 归一化后参与去重）",
+    )
+
+
+class ShareRevoke(BaseModel):
+    token: str
+
+
 # ---------------------------------------------------------------------------
 # 应用
 # ---------------------------------------------------------------------------
@@ -231,7 +291,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="三角嗅辨盲评工作台", version="1.2", lifespan=lifespan)
+app = FastAPI(title="三角嗅辨盲评工作台", version="1.3", lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -327,6 +387,10 @@ def get_test(test_code: str, token: str):
             "WHERE test_id = ? AND status = ?",
             (row["id"], WITHDRAWN),
         ).fetchone()["c"]
+        shares = conn.execute(
+            "SELECT * FROM shares WHERE test_id = ? ORDER BY id",
+            (row["id"],),
+        ).fetchall()
     finally:
         conn.close()
 
@@ -357,6 +421,8 @@ def get_test(test_code: str, token: str):
             "abstained": abstained,
             "valid": valid,
         },
+        # 已生成的脱敏结果分享凭证（仅负责人可见，纯增量字段，不影响既有调用方）
+        "shares": [share_admin_json(s, ts) for s in shares],
     }
 
 
@@ -730,6 +796,175 @@ def timeline(test_code: str, token: str):
         "history_complete": all(e["type"] != "history_start" for e in events),
         "events": [render_event(e, settled, assign_by_code) for e in events],
     }
+
+
+# ---------------------------------------------------------------------------
+# 脱敏结果分享凭证：生成 / 撤销（负责人）/ 只读（不记名）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tests/{test_code}/shares")
+def create_share(test_code: str, body: ShareCreate):
+    """为已结算实验生成脱敏结果分享凭证。
+
+    - 凭现有管理凭证（测试码 + 负责人令牌）；仅已结算实验可生成。
+    - ttl_seconds 1..604800（最长 7 天）；note 可选、trim 归一化后参与去重。
+    - 同一实验、同一备注、同一有效期重复请求返回原凭证（reused=true）。
+    - 同实验同备注但有效期不同（或反之）视为冲突，返回 409。
+    - 生成写入操作时间线（share_create，与凭证同一写事务）。
+    """
+    note = (body.note or "").strip()
+    if len(note) > MAX_SHARE_NOTE_LEN:
+        raise HTTPException(status_code=422,
+                            detail=f"备注长度不得超过 {MAX_SHARE_NOTE_LEN} 字")
+
+    with db.write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (test_code,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="测试不存在")
+        verify_admin(row, body.token)
+
+        if row["settled_at"] is None:
+            raise HTTPException(status_code=409,
+                                detail="实验尚未结算，仅已结算实验可生成分享凭证")
+
+        ts = now_ts()
+        existing = conn.execute(
+            "SELECT * FROM shares WHERE test_id = ? AND note = ? ORDER BY id",
+            (row["id"], note),
+        ).fetchall()
+        same = [s for s in existing if s["ttl_seconds"] == body.ttl_seconds]
+        if same:
+            # 幂等：同实验同备注同有效期（无论原凭证是否已过期/已撤销）返回原凭证
+            s = same[0]
+            reused = True
+        else:
+            if existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail="同一实验已存在相同备注但有效期不同的分享凭证，"
+                           "内容冲突；请更换备注或使用原有效期",
+                )
+            # 全新凭证：高熵随机码，撞 UNIQUE 则重取
+            while True:
+                share_code = new_code(16)
+                if conn.execute(
+                    "SELECT 1 FROM shares WHERE share_code = ?", (share_code,)
+                ).fetchone() is None:
+                    break
+            conn.execute(
+                """INSERT INTO shares
+                   (test_id, share_code, note, ttl_seconds,
+                    created_at, expires_at, revoked_at)
+                   VALUES (?, ?, ?, ?, ?, ?, NULL)""",
+                (row["id"], share_code, note, body.ttl_seconds,
+                 ts, ts + body.ttl_seconds),
+            )
+            s = conn.execute(
+                "SELECT * FROM shares WHERE share_code = ?", (share_code,)
+            ).fetchone()
+            # 凭证与审计事件同一写事务提交；事件不含完整凭证明文
+            db.log_event(conn, row["id"], ts, "share_create", {
+                "share_id": s["id"],
+                "note": note,
+                "ttl_seconds": body.ttl_seconds,
+                "expires_at": (ts + body.ttl_seconds) * 1000,
+                "code_hint": share_code[:4],
+            })
+            reused = False
+
+    out = share_admin_json(s, now_ts())
+    out["test_code"] = row["code"]
+    out["reused"] = reused
+    return out
+
+
+@app.post("/api/tests/{test_code}/shares/{share_code}/revoke")
+def revoke_share(test_code: str, share_code: str, body: ShareRevoke):
+    """负责人在到期前撤销分享凭证；重复撤销 / 撤销已过期凭证返回 409。
+
+    撤销写入操作时间线（share_revoke，与状态变更同一写事务）。
+    """
+    with db.write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (test_code,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="测试不存在")
+        verify_admin(row, body.token)
+
+        s = conn.execute(
+            "SELECT * FROM shares WHERE test_id = ? AND share_code = ?",
+            (row["id"], share_code),
+        ).fetchone()
+        if s is None:
+            raise HTTPException(status_code=404, detail="分享凭证不存在")
+        if s["revoked_at"] is not None:
+            raise HTTPException(status_code=409, detail="分享凭证已撤销，不能重复撤销")
+
+        ts = now_ts()
+        if ts >= s["expires_at"]:
+            raise HTTPException(status_code=409, detail="分享凭证已到期，无需撤销")
+
+        conn.execute("UPDATE shares SET revoked_at = ? WHERE id = ?", (ts, s["id"]))
+        db.log_event(conn, row["id"], ts, "share_revoke", {
+            "share_id": s["id"],
+            "note": s["note"],
+            "ttl_seconds": s["ttl_seconds"],
+            "created_at": s["created_at"] * 1000,
+            "expires_at": s["expires_at"] * 1000,
+            "code_hint": s["share_code"][:4],
+        })
+        s = conn.execute("SELECT * FROM shares WHERE id = ?", (s["id"],)).fetchone()
+
+    out = share_admin_json(s, now_ts())
+    out["test_code"] = row["code"]
+    out["ok"] = True
+    return out
+
+
+@app.get("/api/shares/{share_code}")
+def read_share(share_code: str):
+    """不记名只读：凭分享凭证取脱敏后的已结算结果。
+
+    - 凭证不存在 → 404；已撤销或已到期 → 403（一律拒绝读取）。
+    - 只返回样本编号、截止与结算时间、有效答卷数、答对数、弃权数、未交数、
+      单侧尾概率和可辨结论；不返回评员姓名、盲评码、个人答案或异样杯对应关系。
+    """
+    conn = db.read_conn()
+    try:
+        s = conn.execute(
+            "SELECT * FROM shares WHERE share_code = ?", (share_code,)
+        ).fetchone()
+        if s is None:
+            raise HTTPException(status_code=404, detail="分享凭证无效")
+        if s["revoked_at"] is not None:
+            raise HTTPException(status_code=403, detail="分享凭证已被撤销")
+        now = now_ts()
+        if now >= s["expires_at"]:
+            raise HTTPException(status_code=403, detail="分享凭证已过期")
+
+        test = conn.execute(
+            "SELECT * FROM tests WHERE id = ?", (s["test_id"],)
+        ).fetchone()
+        if test is None or test["settled_at"] is None:
+            # 数据完整性异常或测试被删除：凭证不能读到任何内容
+            raise HTTPException(status_code=404, detail="分享凭证无效")
+        agg = conn.execute(
+            "SELECT "
+            "SUM(CASE WHEN answer = ? THEN 1 ELSE 0 END) AS abstained, "
+            "SUM(CASE WHEN answer IS NULL THEN 1 ELSE 0 END) AS missing "
+            "FROM assignments WHERE test_id = ? AND status = ?",
+            (ABSTAIN, test["id"], ACTIVE),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    return sanitized_result(test, {
+        "abstained": agg["abstained"] or 0,
+        "missing": agg["missing"] or 0,
+    }, now)
 
 
 # ---------------------------------------------------------------------------
